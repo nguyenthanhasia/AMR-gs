@@ -1,9 +1,14 @@
+import logging
+import re
+import json
 import random
 import torch
 from torch import nn
 import numpy as np
 from parser.AMRGraph import AMRGraph
 from parser.extract import read_file
+
+logger=logging
 
 PAD, UNK, DUM, NIL, END, CLS = '<PAD>', '<UNK>', '<DUMMY>', '<NULL>', '<END>', '<CLS>'
 GPU_SIZE = 12000 # okay for 8G memory
@@ -157,7 +162,7 @@ def batchify(data, vocabs, unk_rate=0.):
     return ret
     
 class DataLoader(object):
-    def __init__(self, vocabs, lex_map, filename, batch_size, for_train):
+    def __init__(self, vocabs, lex_map, filename, batch_size, for_train, **kwargs):
         self.data = []
         bert_tokenizer = vocabs.get('bert_tokenizer', None)
         for amr, token, lemma, pos, ner in zip(*read_file(filename)):
@@ -218,3 +223,402 @@ class DataLoader(object):
 
         for batch in batches:
             yield batchify(batch, self.vocabs, self.unk_rate)
+
+
+class Curriculum:
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.data_difficulty = None
+
+    def compute_data_difficulty(self):
+        raw = np.array([
+            self.get_item_difficulty(item) for item in self.data
+        ],dtype='float')
+        cdf = (raw[None,:] <= raw[:,None]).mean(axis=1)
+        self.data_difficulty = cdf
+        self.raw_data_difficulty = raw
+    
+    def difficulty(self, itemidx):
+        if self.data_difficulty is None: 
+            self.compute_data_difficulty()
+        return self.data_difficulty[itemidx]
+
+class MeanCurriculum(Curriculum):
+    def compute_data_difficulty(self):
+        raw = np.array([
+            self.get_item_difficulty(item) for item in self.data
+        ],dtype='float')
+
+        # the further from the mean the more difficult
+        dist2mean = np.abs(raw - raw.mean())
+
+        cdf = (dist2mean[None,:] <= dist2mean[:,None]).mean(axis=1)
+        self.data_difficulty = cdf
+        self.raw_data_difficulty = dist2mean
+    
+
+class CompetenceBasedCurriculumDataIter:
+    def __init__(self, *args, curriculum_len=None, initial_competence=None, slope_power=2, **kwargs):
+        assert curriculum_len
+        assert initial_competence
+        assert float(slope_power)
+        
+        super().__init__(*args, **kwargs)
+
+        self.curriculum_len = curriculum_len
+        self.initial_competence = initial_competence
+        self.initial_competence_powered = initial_competence ** slope_power
+        self.slope_power = slope_power
+        self.timestep = -1
+    
+    def difficulty(self, itemidx): 
+        return super().difficulty(itemidx)
+
+    def competence(self, timestep):
+        return 1 if timestep >= self.curriculum_len else ( timestep * ( 1 - self.initial_competence_powered ) / self.curriculum_len + self.initial_competence_powered ) ** ( 1 / self.slope_power ) 
+
+    def __iter__(self):
+        if not self.train: 
+            yield from super().__iter__()
+            return
+
+        self.timestep += 1
+        timestep = self.timestep
+
+        current_competence = self.competence(timestep)
+
+        sampled_data = [item for idx, item in enumerate(self.data) if self.difficulty(idx) <= current_competence + 0.0001]
+        idx = list(range(len(sampled_data)))
+        random.shuffle(idx)
+        idx.sort(key = lambda x: len(sampled_data[x]['tok']) + len(sampled_data[x]['amr']))
+
+        batches = []
+        num_tokens, data = 0, []
+        for i in idx:
+            num_tokens += len(sampled_data[i]['tok']) + len(sampled_data[i]['amr'])
+            data.append(sampled_data[i])
+            if num_tokens >= self.batch_size:
+                sz = len(data)* (2 + max(len(x['tok']) for x in data) + max(len(x['amr']) for x in data))
+                if sz > GPU_SIZE:
+                    # because we only have limited GPU memory
+                    batches.append(data[:len(data)//2])
+                    data = data[len(data)//2:]
+                batches.append(data)
+                num_tokens, data = 0, []
+        if data:
+            sz = len(data)* (2 + max(len(x['tok']) for x in data) + max(len(x['amr']) for x in data))
+            if sz > GPU_SIZE:
+                # because we only have limited GPU memory
+                batches.append(data[:len(data)//2])
+                data = data[len(data)//2:]
+            batches.append(data)
+        
+        random.shuffle(batches)
+        
+        logger.info('timestep %d, sample-size %d, batches %d, competence %.3f'%(timestep, len(sampled_data), len(batches), current_competence))
+        for batch in batches:
+            yield batchify(batch, self.vocabs, self.unk_rate)
+
+class BatchCompetenceBasedCurriculumDataIter:
+    def __init__(self, *args, curriculum_len=None, initial_competence=None, slope_power=2, **kwargs):
+        assert curriculum_len
+        assert initial_competence
+        assert float(slope_power)
+        
+        super().__init__(*args, **kwargs)
+
+        self.curriculum_len = curriculum_len
+        self.initial_competence = initial_competence
+        self.initial_competence_powered = initial_competence ** slope_power
+        self.slope_power = slope_power
+        self.timestep = -1
+    
+    def difficulty(self, itemidx): 
+        return super().difficulty(itemidx)
+
+    def competence(self, timestep):
+        return 1 if timestep >= self.curriculum_len else ( timestep * ( 1 - self.initial_competence_powered ) / self.curriculum_len + self.initial_competence_powered ) ** ( 1 / self.slope_power ) 
+
+    def __iter__(self):
+        if not self.train: 
+            yield from super().__iter__()
+            return
+
+        if self.timestep >= self.curriculum_len:
+            yield from super().__iter__()
+            return
+
+        curriculum_stat={'nexamples':0,'timestep':0,'competence':0}
+        for timestep in range(self.curriculum_len):
+            self.timestep = timestep
+            current_competence = self.competence(timestep)
+            sampled_data = [item for idx, item in enumerate(self.data) if self.difficulty(idx) <= current_competence + 0.0001]
+            idx = list(range(len(sampled_data)))
+            random.shuffle(idx)
+            num_tokens, data = 0, []
+            
+            for i in idx:
+                num_tokens += len(sampled_data[i]['tok']) + len(sampled_data[i]['amr'])
+                data.append(sampled_data[i])
+                if num_tokens >= self.batch_size:
+                    break
+            if data:
+                sz = len(data)* (2 + max(len(x['tok']) for x in data) + max(len(x['amr']) for x in data))
+                if sz > GPU_SIZE:
+                    # because we only have limited GPU memory
+                    batch = data[:len(data)//2]
+                else:
+                    batch = data
+                yield batchify(batch, self.vocabs, self.unk_rate)
+
+            curriculum_stat['nexamples'] += len(batch)
+            curriculum_stat['timestep'] = timestep
+            curriculum_stat['competence'] = current_competence
+            if (timestep + 1) % int(self.curriculum_len/10) == 0:
+                logger.info('curriculum-stat %s'%json.dumps(curriculum_stat))
+
+        self.timestep += 1
+
+class OrderedCurriculumDataIter:
+
+    def difficulty(self, itemidx): 
+        return super().difficulty(itemidx)
+
+    def __iter__(self):
+        if not self.train: 
+            yield from super().__iter__()
+            return
+
+        sampled_data = self.data
+        idx = list(range(len(sampled_data)))
+        idx.sort(key=self.difficulty)
+
+        batches = []
+        num_tokens, data = 0, []
+        for i in idx:
+            num_tokens += len(sampled_data[i]['tok']) + len(sampled_data[i]['amr'])
+            data.append(sampled_data[i])
+            if num_tokens >= self.batch_size:
+                sz = len(data)* (2 + max(len(x['tok']) for x in data) + max(len(x['amr']) for x in data))
+                if sz > GPU_SIZE:
+                    # because we only have limited GPU memory
+                    batches.append(data[:len(data)//2])
+                    data = data[len(data)//2:]
+                batches.append(data)
+                num_tokens, data = 0, []
+        if data:
+            sz = len(data)* (2 + max(len(x['tok']) for x in data) + max(len(x['amr']) for x in data))
+            if sz > GPU_SIZE:
+                # because we only have limited GPU memory
+                batches.append(data[:len(data)//2])
+                data = data[len(data)//2:]
+            batches.append(data)
+
+        for batch in batches:
+            yield batchify(batch, self.vocabs, self.unk_rate)
+
+
+class WaveCurriculumDataIter:
+
+    def difficulty(self, itemidx): 
+        return super().difficulty(itemidx)
+
+    def __iter__(self):
+        if not self.train: 
+            yield from super().__iter__()
+            return
+
+        sampled_data = self.data
+        idx = list(range(len(sampled_data)))
+        idx.sort(key=self.difficulty)
+        idx = idx[::2] + idx[1::2][::-1]
+
+        batches = []
+        num_tokens, data = 0, []
+        for i in idx:
+            num_tokens += len(sampled_data[i]['tok']) + len(sampled_data[i]['amr'])
+            data.append(sampled_data[i])
+            if num_tokens >= self.batch_size:
+                sz = len(data)* (2 + max(len(x['tok']) for x in data) + max(len(x['amr']) for x in data))
+                if sz > GPU_SIZE:
+                    # because we only have limited GPU memory
+                    batches.append(data[:len(data)//2])
+                    data = data[len(data)//2:]
+                batches.append(data)
+                num_tokens, data = 0, []
+        if data:
+            sz = len(data)* (2 + max(len(x['tok']) for x in data) + max(len(x['amr']) for x in data))
+            if sz > GPU_SIZE:
+                # because we only have limited GPU memory
+                batches.append(data[:len(data)//2])
+                data = data[len(data)//2:]
+            batches.append(data)
+
+        for batch in batches:
+            yield batchify(batch, self.vocabs, self.unk_rate)
+
+
+class DAMR:
+
+    def get_amr_difficulty(self, amr): raise NotImplementedError
+
+    def get_item_difficulty(self, item): 
+        return self.get_amr_difficulty(item['amr'])
+    
+    def __init__(self,*args,**kwargs):
+        self.concept_idf=None
+        self.rel_idf=None
+        super().__init__(*args,**kwargs)
+
+    def compute_concept_idf(self):
+        df = {}
+        for item in self.data:
+            for node in item['amr'].nodes:
+                concept = item['amr'].name2concept[node]
+                df[concept] = df.get(concept,0)+1
+        self.concept_idf = {c:np.log(len(self.data)/v) for c,v in df.items()}
+
+    def compute_rel_idf(self):
+        df = {}
+        for item in self.data:
+            for src,tgts in item['amr'].edges.items():
+                for rel,tgt in tgts:
+                    df[rel] = df.get(rel, 0) + 1
+        self.rel_idf = {c:np.log(len(self.data)/v) for c,v in df.items()}
+
+    def rel_difficulty(self,rel):
+        if self.rel_idf is None:
+            self.compute_rel_idf()
+        if 'ARG' in rel: return 1
+        return 1 + self.rel_idf.get(rel, 1) 
+    
+    def concept_difficulty(self, concept):
+        if self.concept_idf is None:
+            self.compute_concept_idf()
+        return 1 + self.concept_idf.get(concept, 1)
+
+    
+class DAMRR0(DAMR):
+    def rel_difficulty(self,rel):
+#         if self.rel_idf is None:
+#             self.compute_rel_idf()
+        if 'ARG' in rel: return 1
+        return 2
+    
+    def concept_difficulty(self, concept):
+        if self.concept_idf is None:
+            self.compute_concept_idf()
+        if re.match(r'^.*-\d+$',concept):
+            return 1 + self.concept_idf.get(concept, 1)
+        return 1
+
+class DAMRV1(DAMR):
+
+    def _get_nodes_depth(self, amr):
+        depths = {amr.root:1}
+        while True:
+            added=False
+            for node, depth in list(depths.items()):
+                for _,tgt in amr.edges.get(node,[]):
+                    if tgt not in depths:
+                        depths[tgt] = depth + 1
+                        added = True
+            if not added: break
+        # this should not happen   
+        for node in amr.nodes:
+            if node not in depths:
+                depths[node]=1
+        return depths
+    
+    def get_amr_difficulty(self, amr):
+        difficulty = 0
+        nodes_depth = self._get_nodes_depth(amr)
+
+        for node in amr.nodes:
+            concept = amr.name2concept[node]
+            difficulty += self.concept_difficulty(concept) * nodes_depth[node] ** 2
+
+        return difficulty
+
+
+class DAMRV2(DAMR):
+
+    def get_amr_difficulty(self, amr):
+        difficulty = 0
+        for src,tgts in amr.edges.items():
+            src_c = amr.name2concept[src]
+            for rel,tgt in tgts:
+                tgt_c = amr.name2concept[tgt]
+                difficulty+= self.rel_difficulty(rel) * (self.concept_difficulty(src_c) + self.concept_difficulty(tgt_c))
+        
+        return difficulty
+
+DATA_LOADERS = {
+    "DataLoader":DataLoader,
+    "DefaultDataLoader":DataLoader
+}
+
+def register_dataloader(name=None):
+    def register(dataloader_class):
+        cname = name or dataloader_class.__name__
+        if cname in DATA_LOADERS: raise ValueError('duplicate dataloader name %s'%cname)
+        DATA_LOADERS[cname] = dataloader_class
+        return dataloader_class
+    return register
+
+@register_dataloader()
+class DAMRV1_CompetenceBasedCurriculumDataLoader(
+        DAMRV1,
+        CompetenceBasedCurriculumDataIter,
+        Curriculum,DataLoader):
+    pass
+
+@register_dataloader()
+class DAMRV2_CompetenceBasedCurriculumDataLoader(
+        DAMRV2,
+        CompetenceBasedCurriculumDataIter,
+        Curriculum,DataLoader):
+    pass
+
+@register_dataloader()
+class DAMRV2_BatchCompetenceBasedCurriculumDataLoader(
+        DAMRV2,
+        BatchCompetenceBasedCurriculumDataIter,
+        Curriculum,DataLoader):
+    pass
+
+@register_dataloader()
+class DAMRV2_CompetenceBasedMeanCurriculumDataLoader(
+        DAMRV2,
+        CompetenceBasedCurriculumDataIter,
+        MeanCurriculum,DataLoader):
+    pass
+
+@register_dataloader()
+class DAMRR0V2_CompetenceBasedCurriculumDataLoader(
+        DAMRR0,
+        DAMRV2,
+        CompetenceBasedCurriculumDataIter,
+        Curriculum,DataLoader):
+    pass
+
+@register_dataloader()
+class DAMRV1_OrderedCurriculumDataLoader(
+        DAMRV1,
+        OrderedCurriculumDataIter, 
+        Curriculum,DataLoader):
+    pass
+
+@register_dataloader()
+class DAMRV2_OrderedCurriculumDataLoader(
+        DAMRV2,
+        OrderedCurriculumDataIter, 
+        Curriculum,DataLoader):
+    pass
+
+@register_dataloader()
+class DAMRV2_WaveCurriculumDataLoader(
+        DAMRV2,
+        WaveCurriculumDataIter, 
+        Curriculum,DataLoader):
+    pass

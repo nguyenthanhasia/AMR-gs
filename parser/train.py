@@ -1,9 +1,14 @@
+from datetime import datetime
+from tqdm import tqdm
+import logging
+import json
+
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
 import argparse, os, random
-from parser.data import Vocab, DataLoader, DUM, END, CLS, NIL
+from parser.data import Vocab, DATA_LOADERS, DUM, END, CLS, NIL
 from parser.parser import Parser
 from parser.work import show_progress
 from parser.extract import LexicalMap
@@ -12,6 +17,8 @@ from parser.utils import move_to_device
 from parser.bert_utils import BertEncoderTokenizer, BertEncoder
 from parser.postprocess import PostProcessor
 from parser.work import parse_data
+
+logging.basicConfig(format='%(asctime)s [%(levelname)s] %(message)s',level=logging.INFO)
 
 def parse_config():
     parser = argparse.ArgumentParser()
@@ -64,13 +71,18 @@ def parse_config():
     parser.add_argument('--ckpt', type=str)
     parser.add_argument('--print_every', type=int)
     parser.add_argument('--eval_every', type=int)
-
+    parser.add_argument('--eval_start', type=int, default=10000)
+    
 
     parser.add_argument('--world_size', type=int)
     parser.add_argument('--gpus', type=int)
     parser.add_argument('--MASTER_ADDR', type=str)
     parser.add_argument('--MASTER_PORT', type=str)
     parser.add_argument('--start_rank', type=int)
+
+    # more options
+    parser.add_argument('--dataloader', default='DefaultDataLoader')
+    parser.add_argument('--dataloader-kwargs', type=json.loads, default={})
 
     return parser.parse_args()
 
@@ -116,6 +128,8 @@ def load_vocabs(args):
     return vocabs, lexical_mapping
 
 def main(local_rank, args):
+
+    DataLoader = DATA_LOADERS[args.dataloader]
     vocabs, lexical_mapping = load_vocabs(args)
     bert_encoder = None
     if args.with_bert:
@@ -144,7 +158,7 @@ def main(local_rank, args):
         random.seed(19940117+dist.get_rank())
 
     model = model.cuda(local_rank)
-    dev_data = DataLoader(vocabs, lexical_mapping, args.dev_data, args.dev_batch_size, for_train=False)
+    dev_data = DataLoader(vocabs, lexical_mapping, args.dev_data, args.dev_batch_size, for_train=False, **args.dataloader_kwargs)
     pp = PostProcessor(vocabs['rel']) 
 
     weight_decay_params = []
@@ -168,7 +182,7 @@ def main(local_rank, args):
         del ckpt
 
 
-    train_data = DataLoader(vocabs, lexical_mapping, args.train_data, args.train_batch_size, for_train=True)
+    train_data = DataLoader(vocabs, lexical_mapping, args.train_data, args.train_batch_size, for_train=True, **args.dataloader_kwargs)
     train_data.set_unk_rate(args.unk_rate)
     queue = mp.Queue(10)
     train_data_generator = mp.Process(target=data_proc, args=(train_data, queue))
@@ -176,11 +190,17 @@ def main(local_rank, args):
     train_data_generator.start()
     model.train()
     epoch, loss_avg, concept_loss_avg, arc_loss_avg, rel_loss_avg = 0, 0, 0, 0, 0
+    if args.world_size == 1 or (dist.get_rank() == 0):
+        logging.basicConfig(format='%(asctime)s [%(levelname)s] %(message)s',level=logging.INFO)
+        logger = logging.getLogger(__name__)
+        logger.info('TRAINING STARTED')
+        # pbar = tqdm(desc='Batches')
     while True:
         batch = queue.get() 
         if isinstance(batch, str):
             epoch += 1
-            print ('epoch', epoch, 'done', 'batches', batches_acm)
+            if args.world_size == 1 or (dist.get_rank() == 0):
+                logger.info('epoch %s done batches %s datastate %s'%(epoch, batches_acm, json.dumps(getattr(train_data,'state',{}))))
         else: 
             batch = move_to_device(batch, model.device)
             concept_loss, arc_loss, rel_loss, graph_arc_loss = model(batch)
@@ -189,7 +209,8 @@ def main(local_rank, args):
             concept_loss_value = concept_loss.item()
             arc_loss_value = arc_loss.item()
             rel_loss_value = rel_loss.item() 
-            loss_avg = loss_avg * args.batches_per_update * 0.8 + 0.2 * loss_value
+            # loss_avg = loss_avg * args.batches_per_update * 0.8 + 0.2 * loss_value ## WHY?
+            loss_avg = loss_avg * 0.8 + 0.2 * loss_value
             concept_loss_avg = concept_loss_avg * 0.8 + 0.2 * concept_loss_value
             arc_loss_avg = arc_loss_avg * 0.8 + 0.2 * arc_loss_value
             rel_loss_avg = rel_loss_avg * 0.8 + 0.2 * rel_loss_value
@@ -206,10 +227,11 @@ def main(local_rank, args):
             optimizer.step()
             optimizer.zero_grad()
             if args.world_size == 1 or (dist.get_rank() == 0):
+                # pbar.update(1)
                 if batches_acm % args.print_every == -1 % args.print_every:
-                    print ('Train Epoch %d, Batch %d, LR %.6f, conc_loss %.3f, arc_loss %.3f, rel_loss %.3f'%(epoch, batches_acm, lr, concept_loss_avg, arc_loss_avg, rel_loss_avg))
+                    logger.info('Train Epoch %d, Batch %d, LR %.6f, loss %.3f, conc_loss %.3f, arc_loss %.3f, rel_loss %.3f'%(epoch, batches_acm, lr, loss_avg, concept_loss_avg, arc_loss_avg, rel_loss_avg))
                     model.train()
-                if (batches_acm>10000 or args.resume_ckpt is not None) and batches_acm % args.eval_every == -1 % args.eval_every:
+                if (batches_acm>args.eval_start or args.resume_ckpt is not None) and batches_acm % args.eval_every == -1 % args.eval_every:
                     model.eval()
                     parse_data(model, pp, dev_data, args.dev_data, '%s/epoch%d_batch%d_dev_out'%(args.ckpt, epoch, batches_acm))
                     torch.save({'args':args, 
