@@ -14,8 +14,9 @@ class FeatureAnnotator:
                    'hundreds', 'thousands', 'millions', 'billions', 'trillions')
     DashedNumbers = re.compile(r'-*\d+-\d+')
 
-    def __init__(self, url, compound_map_file):
-        self.nlp = StanfordCoreNLP(url)
+    def __init__(self, client, compound_map_file):
+        #self.nlp = StanfordCoreNLP(url)
+        self.nlp=client
         self.nlp_properties = {
             'annotators': "tokenize,ssplit,pos,lemma,ner",
             "tokenize.options": "splitHyphenated=true,normalizeParentheses=false",
@@ -60,15 +61,15 @@ class FeatureAnnotator:
                 len(tokens), len(value), '\n', list(zip(tokens, value)), tokens, value)
 
     def annotate(self, text):
-        tokens = self.nlp.annotate(text.strip(), self.nlp_properties)['sentences'][0]['tokens']
+        tokens = self.nlp.annotate(text.strip(), self.nlp_properties).sentences.[0].token
         output = dict(
             tokens=[], lemmas=[], pos_tags=[], ner_tags=[]
         )
         for token in tokens:
-            output['tokens'].append(token['word'])
-            output['lemmas'].append(token['lemma'])
-            output['pos_tags'].append(token['pos'])
-            output['ner_tags'].append(token['ner'])
+            output['tokens'].append(token.word)
+            output['lemmas'].append(token.lemma)
+            output['pos_tags'].append(token.pos)
+            output['ner_tags'].append(token.ner)
         return output
 
     def __call__(self, text):
@@ -187,6 +188,12 @@ if __name__ == '__main__':
     import argparse
 
     from stog.data.dataset_readers.amr_parsing.io import AMRIO
+    from stanza.server import CoreNLPClient
+    client = CoreNLPClient(
+        annotators=['tokenize','ssplit', 'pos', 'lemma', 'ner'], 
+        memory='4G', 
+        endpoint='http://localhost:9001',
+        be_quiet=True)
 
     parser = argparse.ArgumentParser('feature_annotator.py')
     parser.add_argument('files', nargs='+', help='files to annotate.')
@@ -194,7 +201,7 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    annotator = FeatureAnnotator('http://localhost:9000', args.compound_file)
+    annotator = FeatureAnnotator(client, args.compound_file)
 
     for file_path in args.files:
         logger.info('Processing {}'.format(file_path))
