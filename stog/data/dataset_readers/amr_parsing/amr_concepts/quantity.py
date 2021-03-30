@@ -230,6 +230,9 @@ class Quantity:
                         AlignedPairs(tokens, i, index, self.amr, score, near))
             candidate_alignments.append(alignment)
         candidate_alignments.sort(key=lambda x: (-x.score, -x.near))
+        n = len(candidate_alignments)
+        while len(candidate_alignments)<2:#edited by thanhnh
+            candidate_alignments.append(Alignment(node, attr, value))
         return candidate_alignments[0], candidate_alignments[1:]
 
     def get_node_position(self, node):
